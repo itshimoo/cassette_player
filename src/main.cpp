@@ -1,5 +1,13 @@
 #include <Arduino.h>
 #include <PID_v1.h>
+#include <Adafruit_INA260.h>
+
+// === TAPE END SETUP ===
+const int tape_end = 32;
+float filteredTapeEnd = 0;
+float tapeEndAlpha = 0.1; // Lower = smoother
+const int tapeEndThreshold = 1000; // Adjust based on real tape_end signal
+bool tapeIsPresent = true;
 
 // === MOTOR SETUP ===
 const int motorIn1 = 17;
@@ -13,11 +21,15 @@ const int PULSES_PER_REV = MOTOR_PPR * GEAR_RATIO; // = 140
 volatile long encoderTicks = 0;
 
 // === PID VARIABLES ===
-double targetRPM = 60.0;
+double targetRPM = 40.0;
 double currentRPM = 0;
 double pwmOutput = 0;
 double Kp = 0.2, Ki = 0.07, Kd = 0.01;
+
 PID motorPID(&currentRPM, &pwmOutput, &targetRPM, Kp, Ki, Kd, DIRECT);
+
+// === INA260 SENSOR ===
+Adafruit_INA260 ina260;
 
 // === TIMING ===
 const int interval = 150; // ms
@@ -64,7 +76,6 @@ void handleSerial() {
       return;
     }
 
-    // Parse one-liner
     if (!systemRunning) {
       double newKp = Kp;
       double newKi = Ki;
@@ -104,9 +115,18 @@ void setup() {
   pinMode(motorIn1, OUTPUT);
   pinMode(motorIn2, OUTPUT);
   pinMode(encoderPinA, INPUT_PULLUP);
+  pinMode(tape_end, INPUT);
 
   attachInterrupt(digitalPinToInterrupt(encoderPinA), encoderISR, RISING);
   setupPWM();
+
+  // INA260 initialization
+  if (!ina260.begin()) {
+    Serial.println("Couldn't find INA260 chip. Check wiring.");
+    while (1);
+  }
+  ina260.setAveragingCount(INA260_COUNT_128);
+  Serial.println("INA260 sensor initialized.");
 
   motorPID.SetMode(AUTOMATIC);
   motorPID.SetSampleTime(interval);
@@ -141,14 +161,25 @@ void loop() {
     // Drive motor
     driveMotor(pwmOutput);
 
-    // Debug/Plot Output
+    // Read and filter tape_end sensor
+    float rawTape = analogRead(tape_end);
+    filteredTapeEnd = tapeEndAlpha * rawTape + (1 - tapeEndAlpha) * filteredTapeEnd;
+    tapeIsPresent = (filteredTapeEnd > tapeEndThreshold);
+
+    // Read current (in mA)
+    float current_mA = ina260.readCurrent();
+
+    // Debug output
     Serial.print(targetRPM);
     Serial.print(" ");
     Serial.print(currentRPM);
     Serial.print(" ");
-    Serial.println(pwmOutput);
+    Serial.print(pwmOutput);
+    Serial.print(" ");
+    Serial.print(filteredTapeEnd);
+    Serial.print(" ");
+    Serial.println(tapeIsPresent ? "PRESENT" : "END");
 
     lastTime = now;
   }
 }
-Kp=0.2 Ki=0.077 Kd=0.01 set=60
