@@ -2,184 +2,238 @@
 #include <PID_v1.h>
 #include <Adafruit_INA260.h>
 
-// === TAPE END SETUP ===
-const int tape_end = 32;
-float filteredTapeEnd = 0;
-float tapeEndAlpha = 0.1; // Lower = smoother
-const int tapeEndThreshold = 1000; // Adjust based on real tape_end signal
-bool tapeIsPresent = true;
+// === Motor PWM Pins ===
+const int motorA_Pin1 = 17, motorA_Pin2 = 16;  // Left motor (A)
+const int motorB_Pin1 = 26, motorB_Pin2 = 27;  // Right motor (B)
 
-// === MOTOR SETUP ===
-const int motorIn1 = 17;
-const int motorIn2 = 16;
+// === Encoder Pins ===
+const int encoderPinA = 18;  // Motor A
+const int encoderPinB = 19;  // Motor B
+volatile long encoderTicksA = 0;
+volatile long encoderTicksB = 0;
 
-// === ENCODER SETUP ===
-const int encoderPinA = 18;
+// === Encoder Setup ===
 const int MOTOR_PPR = 7;
 const int GEAR_RATIO = 20;
-const int PULSES_PER_REV = MOTOR_PPR * GEAR_RATIO; // = 140
-volatile long encoderTicks = 0;
+const int PULSES_PER_REV = MOTOR_PPR * GEAR_RATIO;
 
-// === PID VARIABLES ===
-double targetRPM = 40.0;
-double currentRPM = 0;
-double pwmOutput = 0;
+// === PID for Master ===
+double rpmTarget = 40.0;
+double rpmMeasured = 0;
+double pwmMaster = 0;
 double Kp = 0.2, Ki = 0.07, Kd = 0.01;
+PID speedPID(&rpmMeasured, &pwmMaster, &rpmTarget, Kp, Ki, Kd, DIRECT);
 
-PID motorPID(&currentRPM, &pwmOutput, &targetRPM, Kp, Ki, Kd, DIRECT);
+// === Tension PI Controller ===
+double currentMaster = 0;
+double currentSlave = 0;
+double pwmSlave = 0;
+double Kp_T = 0.5, Ki_T = 0.05;
+double tensionRatio = 0.8;
+double tensionError = 0;
+double tensionIntegral = 0;
 
-// === INA260 SENSOR ===
-Adafruit_INA260 ina260;
+// === INA260 Sensors ===
+Adafruit_INA260 sensorA;  // Motor A (left)
+Adafruit_INA260 sensorB;  // Motor B (right)
 
-// === TIMING ===
-const int interval = 150; // ms
-unsigned long lastTime = 0;
+// === Control State ===
+String masterSide = "left";  // "left" or "right"
 
-// === CONTROL STATE ===
+// === Timing ===
+const int loopInterval = 150;
+unsigned long lastLoopTime = 0;
 bool systemRunning = true;
 
-// === ISR ===
-void IRAM_ATTR encoderISR() {
-  encoderTicks++;
-}
+// === Encoder ISRs ===
+void IRAM_ATTR encoderISRA() { encoderTicksA++; }
+void IRAM_ATTR encoderISRB() { encoderTicksB++; }
 
-// === PWM SETUP ===
+// === Motor PWM Setup ===
 void setupPWM() {
-  ledcAttachPin(motorIn1, 0); // channel 0
-  ledcAttachPin(motorIn2, 1); // channel 1
-  ledcSetup(0, 1000, 8);      // 1 kHz, 8-bit
+  ledcAttachPin(motorA_Pin1, 0);
+  ledcAttachPin(motorA_Pin2, 1);
+  ledcAttachPin(motorB_Pin1, 2);
+  ledcAttachPin(motorB_Pin2, 3);
+  ledcSetup(0, 1000, 8);
   ledcSetup(1, 1000, 8);
+  ledcSetup(2, 1000, 8);
+  ledcSetup(3, 1000, 8);
 }
 
-// === MOTOR CONTROL ===
-void driveMotor(double pwm) {
-  pwm = constrain(pwm, 0, 255);
-  ledcWrite(0, pwm);
-  ledcWrite(1, 0);
-}
-
-void stopMotor() {
-  ledcWrite(0, 0);
-  ledcWrite(1, 0);
-}
-
-// === SERIAL INPUT HANDLER ===
-void handleSerial() {
-  if (Serial.available()) {
-    String input = Serial.readStringUntil('\n');
-    input.trim();
-
-    if (input.length() == 0) {
-      systemRunning = false;
-      stopMotor();
-      Serial.println("[System Paused] Enter new values in format: Kp=0.3 Ki=0.01 Kd=0.2 set=80");
-      return;
-    }
-
-    if (!systemRunning) {
-      double newKp = Kp;
-      double newKi = Ki;
-      double newKd = Kd;
-      double newSet = targetRPM;
-
-      int idx;
-
-      idx = input.indexOf("Kp=");
-      if (idx != -1) newKp = input.substring(idx + 3).toFloat();
-
-      idx = input.indexOf("Ki=");
-      if (idx != -1) newKi = input.substring(idx + 3).toFloat();
-
-      idx = input.indexOf("Kd=");
-      if (idx != -1) newKd = input.substring(idx + 3).toFloat();
-
-      idx = input.indexOf("set=");
-      if (idx != -1) newSet = input.substring(idx + 4).toFloat();
-
-      Kp = newKp;
-      Ki = newKi;
-      Kd = newKd;
-      targetRPM = newSet;
-
-      motorPID.SetTunings(Kp, Ki, Kd);
-      systemRunning = true;
-
-      Serial.printf("Resumed with Kp=%.3f Ki=%.3f Kd=%.3f set=%.1f\n", Kp, Ki, Kd, targetRPM);
-    }
+void driveMotor(double pwm, int pin1, int pin2) {
+  pwm = constrain(pwm, -255, 255);
+  if (pwm >= 0) {
+    ledcWrite(pin1, pwm);
+    ledcWrite(pin2, 0);
+  } else {
+    ledcWrite(pin1, 0);
+    ledcWrite(pin2, -pwm);
   }
 }
 
-// === SETUP ===
+void stopAllMotors() {
+  ledcWrite(0, 0); ledcWrite(1, 0);
+  ledcWrite(2, 0); ledcWrite(3, 0);
+}
+
+// === Encoder RPM Update ===
+void updateEncoderRPM() {
+  long ticks;
+  if (masterSide == "left") {
+    noInterrupts(); ticks = encoderTicksA; encoderTicksA = 0; interrupts();
+  } else {
+    noInterrupts(); ticks = encoderTicksB; encoderTicksB = 0; interrupts();
+  }
+
+  double revs = ticks / (double)PULSES_PER_REV;
+  rpmMeasured = revs * (60000.0 / loopInterval);
+}
+
+void resetControllers() {
+  speedPID.SetMode(MANUAL);
+  pwmMaster = 0;
+  rpmMeasured = 0;
+
+  tensionError = 0;
+  tensionIntegral = 0;
+  pwmSlave = 0;
+
+  encoderTicksA = 0;
+  encoderTicksB = 0;
+
+  speedPID.SetTunings(Kp, Ki, Kd);
+  speedPID.SetMode(AUTOMATIC);
+}
+
+// === Serial Tuning Input ===
+void handleSerialInput() {
+  if (!Serial.available()) return;
+
+  String input = Serial.readStringUntil('\n');
+  input.trim();
+
+  if (input.length() == 0) {
+    systemRunning = false;
+    stopAllMotors();
+    Serial.println("[Paused] Format: Kp=... Ki=... Kd=... set=... Kp_T=... Ki_T=... Tr=... master=left/right");
+    return;
+  }
+
+  double newKp = Kp, newKi = Ki, newKd = Kd, newSet = rpmTarget;
+  double newKp_T = Kp_T, newKi_T = Ki_T, newTr = tensionRatio;
+  String newMaster = masterSide;
+
+  int idx;
+  if ((idx = input.indexOf("Kp=")) != -1) newKp = input.substring(idx + 3).toFloat();
+  if ((idx = input.indexOf("Ki=")) != -1) newKi = input.substring(idx + 3).toFloat();
+  if ((idx = input.indexOf("Kd=")) != -1) newKd = input.substring(idx + 3).toFloat();
+  if ((idx = input.indexOf("set=")) != -1) newSet = input.substring(idx + 4).toFloat();
+  if ((idx = input.indexOf("Kp_T=")) != -1) newKp_T = input.substring(idx + 5).toFloat();
+  if ((idx = input.indexOf("Ki_T=")) != -1) newKi_T = input.substring(idx + 5).toFloat();
+  if ((idx = input.indexOf("Tr=")) != -1) newTr = input.substring(idx + 3).toFloat();
+  if ((idx = input.indexOf("master=")) != -1) {
+    String requested = input.substring(idx + 7);
+    String newMasterSide = (requested == "left") ? "right" : "left";
+    if (newMasterSide != masterSide) {
+      masterSide = newMasterSide;
+      resetControllers();
+    }
+  }
+
+  Kp = newKp; Ki = newKi; Kd = newKd; rpmTarget = newSet;
+  Kp_T = newKp_T; Ki_T = newKi_T; tensionRatio = newTr;
+  speedPID.SetTunings(Kp, Ki, Kd);
+  systemRunning = true;
+
+  Serial.printf("Running | Master: %s | set=%.1f | Kp_T=%.2f Tr=%.2f\n",
+                masterSide.c_str(), rpmTarget, Kp_T, tensionRatio);
+}
+
+// === Tension Control ===
+void updateSlaveMotorPI() {
+  if (masterSide == "left") {
+    currentMaster = sensorA.readCurrent();
+    currentSlave  = sensorB.readCurrent();
+  } else {
+    currentMaster = sensorB.readCurrent();
+    currentSlave  = sensorA.readCurrent();
+  }
+
+  double targetCurrent = tensionRatio * currentMaster;
+  tensionError = targetCurrent - currentSlave;
+  tensionIntegral += tensionError * (loopInterval / 1000.0);
+  tensionIntegral = constrain(tensionIntegral, -100, 100);
+
+  pwmSlave = (Kp_T * tensionError) + (Ki_T * tensionIntegral);
+
+  if (masterSide == "left") {
+    driveMotor(pwmSlave, 2, 3);  // drive motor B
+  } else {
+    driveMotor(pwmSlave, 0, 1);  // drive motor A
+  }
+}
+
+// === Debug ===
+void logStatus() {
+  Serial.printf("RPM: %.1f | PWM Master: %.1f | PWM Slave: %.1f | ISlave: %.1f | IMaster: %.1f\n",
+    rpmMeasured, pwmMaster, pwmSlave, currentSlave, currentMaster);
+}
+
+// === Setup ===
 void setup() {
   Serial.begin(9600);
-  pinMode(motorIn1, OUTPUT);
-  pinMode(motorIn2, OUTPUT);
-  pinMode(encoderPinA, INPUT_PULLUP);
-  pinMode(tape_end, INPUT);
 
-  attachInterrupt(digitalPinToInterrupt(encoderPinA), encoderISR, RISING);
+  pinMode(encoderPinA, INPUT_PULLUP);
+  pinMode(encoderPinB, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(encoderPinA), encoderISRA, RISING);
+  attachInterrupt(digitalPinToInterrupt(encoderPinB), encoderISRB, RISING);
+
   setupPWM();
 
-  // INA260 initialization
-  if (!ina260.begin()) {
-    Serial.println("Couldn't find INA260 chip. Check wiring.");
+  if (!sensorA.begin()) {
+    Serial.println("INA260 A not found!");
     while (1);
   }
-  ina260.setAveragingCount(INA260_COUNT_128);
-  Serial.println("INA260 sensor initialized.");
 
-  motorPID.SetMode(AUTOMATIC);
-  motorPID.SetSampleTime(interval);
-  motorPID.SetOutputLimits(0, 255);
+  if (!sensorB.begin(0x41)) {
+    Serial.println("INA260 B not found at 0x41!");
+    while (1);
+  }
 
-  Serial.println("Running... (press Enter to pause)");
-  Serial.println("Format to resume: Kp=0.3 Ki=0.01 Kd=0.2 set=80");
+  sensorA.setAveragingCount(INA260_COUNT_128);
+  sensorB.setAveragingCount(INA260_COUNT_128);
+
+  speedPID.SetMode(AUTOMATIC);
+  speedPID.SetSampleTime(loopInterval);
+  speedPID.SetOutputLimits(-255, 255);
+
+  Serial.println("System ready. Example:");
+  Serial.println("Kp=0.25 Ki=0.07 Kd=0.01 set=40 Kp_T=1.0 Ki_T=0.05 Tr=1.0 master=left");
 }
 
-// === LOOP ===
+// === Loop ===
 void loop() {
-  handleSerial();
-
-  if (!systemRunning) {
-    return; // system is paused
-  }
+  handleSerialInput();
+  if (!systemRunning) return;
 
   unsigned long now = millis();
-  if (now - lastTime >= interval) {
-    // Calculate RPM
-    noInterrupts();
-    long ticks = encoderTicks;
-    encoderTicks = 0;
-    interrupts();
+  if (now - lastLoopTime >= loopInterval) {
+    lastLoopTime = now;
 
-    double revs = ticks / (double)PULSES_PER_REV;
-    currentRPM = revs * (60000.0 / interval);
+    updateEncoderRPM();
+    speedPID.Compute();
 
-    // Run PID
-    motorPID.Compute();
+    if (masterSide == "left") {
+      driveMotor(pwmMaster, 0, 1);  // Motor A
+    } else {
+      driveMotor(pwmMaster, 2, 3);  // Motor B
+    }
 
-    // Drive motor
-    driveMotor(pwmOutput);
-
-    // Read and filter tape_end sensor
-    float rawTape = analogRead(tape_end);
-    filteredTapeEnd = tapeEndAlpha * rawTape + (1 - tapeEndAlpha) * filteredTapeEnd;
-    tapeIsPresent = (filteredTapeEnd > tapeEndThreshold);
-
-    // Read current (in mA)
-    float current_mA = ina260.readCurrent();
-
-    // Debug output
-    Serial.print(targetRPM);
-    Serial.print(" ");
-    Serial.print(currentRPM);
-    Serial.print(" ");
-    Serial.print(pwmOutput);
-    Serial.print(" ");
-    Serial.print(filteredTapeEnd);
-    Serial.print(" ");
-    Serial.println(tapeIsPresent ? "PRESENT" : "END");
-
-    lastTime = now;
+    updateSlaveMotorPI();
+    logStatus();
   }
 }
+
+// Kp=0.2 Ki=0.07 Kd=0.01 set=40 Kp_T=0.5 Ki_T=0.05 Tr=0.8 master=left
+// Kp=0.2 Ki=0.07 Kd=0.01 set=40 Kp_T=0.5 Ki_T=0.05 Tr=0.8 master=right
